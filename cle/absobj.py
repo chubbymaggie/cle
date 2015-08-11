@@ -1,7 +1,6 @@
 import archinfo
 from .errors import CLEOperationError, CLECompatibilityError, CLEError
 from .memory import Clemory
-from abc import ABCMeta
 import os
 
 import logging
@@ -116,6 +115,16 @@ class Symbol(object):
         return self.sh_info is not None and (self.binding == 'STB_GLOBAL' or \
                                              self.binding == 'STB_WEAK')
 
+    @property
+    def is_function(self):
+        return self.type == 'STT_FUNC'
+
+    @property
+    def is_weak(self):
+        return self.binding == 'STB_WEAK'
+
+reloc_warnings = {}
+
 class Relocation(object):
     """
     A representation of a relocation in a binary file. Smart enough to
@@ -172,16 +181,34 @@ class Relocation(object):
         elif self.type in self.arch.reloc_copy:
             return self.reloc_copy(solist)
         elif self.type in self.arch.reloc_tls_mod_id:
-            return self.reloc_tls_mod_id()
+            return self.reloc_tls_mod_id(solist)
+        elif self.type in self.arch.reloc_tls_doffset:
+            return self.reloc_tls_doffset()
         elif self.type in self.arch.reloc_tls_offset:
-            return self.reloc_tls_offset()
+            return self.reloc_tls_offset(solist)
         else:
-            l.warning("Unknown reloc type: %d", self.type)
+            if not self.owner_obj.arch.name in reloc_warnings:
+                reloc_warnings[self.owner_obj.arch.name] = set()
+            if not self.type in reloc_warnings[self.owner_obj.arch.name]:
+                l.warning("Unknown reloc type: %d", self.type)
+                reloc_warnings[self.owner_obj.arch.name].add(self.type)
 
     def reloc_global(self, solist):
         if not self.resolve_symbol(solist):
             return False
-        self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.rebased_addr)
+
+        if self.type == 21 and self.owner_obj.is_ppc64_abiv1:
+            # R_PPC64_JMP_SLOT
+            # http://osxr.org/glibc/source/sysdeps/powerpc/powerpc64/dl-machine.h?v=glibc-2.15#0405
+            # copy an entire function descriptor struct
+            addr = self.resolvedby.owner_obj.memory.read_addr_at(self.resolvedby.addr)
+            toc = self.resolvedby.owner_obj.memory.read_addr_at(self.resolvedby.addr + 8)
+            aux = self.resolvedby.owner_obj.memory.read_addr_at(self.resolvedby.addr + 16)
+            self.owner_obj.memory.write_addr_at(self.addr, addr)
+            self.owner_obj.memory.write_addr_at(self.addr + 8, toc)
+            self.owner_obj.memory.write_addr_at(self.addr + 16, aux)
+        else:
+            self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.rebased_addr)
         return True
 
     def reloc_absolute(self, solist):
@@ -202,14 +229,30 @@ class Relocation(object):
         self.owner_obj.memory.write_addr_at(self.addr, val)
         return True
 
-    def reloc_tls_mod_id(self):
-        self.owner_obj.memory.write_addr_at(self.addr, self.owner_obj.tls_module_id)
+    def reloc_tls_mod_id(self, solist):
+        if self.symbol.type == 'STT_NOTYPE':
+            self.owner_obj.memory.write_addr_at(self.addr, self.owner_obj.tls_module_id)
+            self.resolve(None)
+        else:
+            if not self.resolve_symbol(solist):
+                return False
+            self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.owner_obj.tls_module_id)
+        return True
+
+    def reloc_tls_doffset(self):
+        self.owner_obj.memory.write_addr_at(self.addr, self.addend + self.symbol.addr)
         self.resolve(None)
         return True
 
-    @staticmethod
-    def reloc_tls_offset():
-        return False
+    def reloc_tls_offset(self, solist):
+        if self.symbol.type == 'STT_NOTYPE':
+            self.owner_obj.memory.write_addr_at(self.addr, self.owner_obj.tls_block_offset + self.addend + self.symbol.addr)
+            self.resolve(None)
+        else:
+            if not self.resolve_symbol(solist):
+                return False
+            self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.owner_obj.tls_block_offset + self.addend + self.symbol.addr)
+        return True
 
     def reloc_mips_global(self, solist):
         if not self.resolve_symbol(solist):
@@ -265,13 +308,11 @@ class Relocation(object):
         return False
 
 class AbsObj(object):
-    __metaclass__ = ABCMeta
-
     """
-        Main abstract class for CLE binary objects.
+        Main base class for CLE binary objects.
     """
 
-    def __init__(self, binary, compatible_with=None, filetype='unknown', **kwargs):
+    def __init__(self, binary, is_main_bin=False, compatible_with=None, filetype='unknown', **kwargs):
         """
         args: binary
         kwargs: {load=True, custom_base_addr=None, custom_entry_point=None,
@@ -283,6 +324,7 @@ class AbsObj(object):
             setattr(self, k, v)
 
         self.binary = binary
+        self.is_main_bin = is_main_bin
         self._entry = None
         self.segments = [] # List of segments
         self.sections = []      # List of sections
@@ -306,13 +348,13 @@ class AbsObj(object):
         self.deps = []           # Needed shared objects (libraries dependencies)
         self.linking = None # Dynamic or static linking
         self.requested_base = None
+        self.pic = False
 
         # Custom options
         self._custom_entry_point = kwargs.get('custom_entry_point', None)
         self.provides = None
 
         self.memory = None
-        self.ppc64_initial_rtoc = None
 
         custom_arch = kwargs.get('custom_arch', None)
         if custom_arch is None:
@@ -329,7 +371,7 @@ class AbsObj(object):
     supported_filetypes = []
 
     def __repr__(self):
-        return '<%s Object %s, maps [%#x:%#x]>' % (self.__class__.__name__, os.path.basename(self.binary), self.get_min_addr() + self.rebase_addr, self.get_max_addr() + self.rebase_addr)
+        return '<%s Object %s, maps [%#x:%#x]>' % (self.__class__.__name__, os.path.basename(self.binary), self.get_min_addr(), self.get_max_addr())
 
     def set_arch(self, arch):
         if self.compatible_with is not None and self.compatible_with.arch != arch:
@@ -346,70 +388,56 @@ class AbsObj(object):
     def contains_addr(self, addr):
         """ Is @vaddr in one of the binary's segments we have loaded ?
         (i.e., is it mapped into memory ?)
-
-        WARNING: in the case of relocatable objects (e.g., libraries), this
-        function works with relative addresses (wrt the start of the object).
-        Remember that statically, the Elf headers define a virtual address of 0
-        for relocatable objects.
-
-        If you try to use this function with a runtime address of a relocated
-        object, you should consider substracting the rebase_addr value to @addr
-        beforehands.
         """
         for i in self.segments:
-            if i.contains_addr(addr):
+            if i.contains_addr(addr - self.rebase_addr):
                 return True
         return False
 
     def find_segment_containing(self, vaddr):
         """ Returns the segment that contains @vaddr, or None """
         for s in self.segments:
-            if s.contains_addr(vaddr):
+            if s.contains_addr(vaddr - self.rebase_addr):
                 return s
 
     def find_section_containing(self, vaddr):
         """ Returns the section that contains @vaddr, or None """
         for s in self.sections:
-            if s.contains_addr(vaddr):
+            if s.contains_addr(vaddr - self.rebase_addr):
                 return s
 
     def addr_to_offset(self, addr):
         for s in self.segments:
-            if s.contains_addr(addr):
-                return s.addr_to_offset(addr)
+            if s.contains_addr(addr - self.rebase_addr):
+                return s.addr_to_offset(addr - self.rebase_addr)
         return None
 
     def offset_to_addr(self, offset):
         for s in self.segments:
             if s.contains_offset(offset):
-                return s.offset_to_addr(offset)
+                return s.offset_to_addr(offset) + self.rebase_addr
 
     def get_min_addr(self):
-        """
-        Return the virtual address of the segment that has the lowest address.
-        WARNING: this is calculated BEFORE rebasing the binaries, therefore,
-        this is only relevant to executable files, as shared libraries should always
-        have 0 as their text segment load addresseses.
+        """ This returns the lowest virtual address contained in any loaded
+        segment of the binary.
         """
 
         out = None
         for segment in self.segments:
             if out is None or segment.min_addr < out:
                 out = segment.min_addr
-        return out
+        return out + self.rebase_addr
 
     def get_max_addr(self):
         """ This returns the highest virtual address contained in any loaded
-        segment of the binary, BEFORE rebasing.
-
-        NOTE: relocation is taken into consideration by ld, not here.
+        segment of the binary.
         """
 
         out = None
         for segment in self.segments:
             if out is None or segment.max_addr > out:
                 out = segment.max_addr
-        return out
+        return out + self.rebase_addr
 
     def set_got_entry(self, symbol_name, newaddr):
         '''
@@ -424,4 +452,24 @@ class AbsObj(object):
             return
 
         self.memory.write_addr_at(self.imports[symbol_name].addr, newaddr)
+
+    def get_initializers(self): # pylint: disable=no-self-use
+        '''
+         Stub function. Should be overridden by backends that can provide
+         initializer functions that ought to be run before execution reaches
+         the entry point. Addresses should be rebased.
+        '''
+        return []
+
+    def get_finalizers(self): # pylint: disable=no-self-use
+        '''
+         Stub function. Like get_initializers, but with finalizers.
+        '''
+        return []
+
+    def get_symbol(self, name): # pylint: disable=no-self-use,unused-argument
+        '''
+         Stub function. Implement to find the symbol with name `name`.
+        '''
+        return None
 

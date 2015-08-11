@@ -9,6 +9,7 @@ from collections import OrderedDict
 
 from .errors import CLEError, CLEOperationError, CLEFileNotFoundError, CLECompatibilityError
 from .memory import Clemory
+from .tls import TLSObj
 
 __all__ = ('Loader',)
 
@@ -26,6 +27,7 @@ class Loader(object):
        shared_objects     A dictionary mapping loaded library names to the objects representing them
        all_objects        A list containing representations of all the different objects loaded
        requested_objects  A set containing the names of all the different shared libraries that were marked as a dependancy by somebody
+       tls_object         An object dealing with the region of memory allocated for thread-local storage
 
     When reference is made to a dictionary of options, it require a dictionary with zero or more of the following keys:
         backend             "elf", "cleextract", "pe", "ida", "blob": which loader backend to use
@@ -39,7 +41,7 @@ class Loader(object):
                  force_load_libs=None, skip_libs=None,
                  main_opts=None, lib_opts=None, custom_ld_path=None,
                  ignore_import_version_numbers=True, rebase_granularity=0x1000000,
-                 except_missing_libs=True):
+                 except_missing_libs=False):
         """
         @param main_binary      The path to the main binary you're loading
         @param auto_load_libs   Whether to automatically load shared libraries that
@@ -73,26 +75,57 @@ class Loader(object):
         self._ignore_import_version_numbers = ignore_import_version_numbers
         self._rebase_granularity = rebase_granularity
         self._except_missing_libs = except_missing_libs
+        self._relocated_objects = set()
 
         self.memory = None
         self.main_bin = None
         self.shared_objects = {}
         self.all_objects = []
         self.requested_objects = set()
+        self.tls_object = None
 
         self._load_main_binary()
         self._load_dependencies()
-        self._perform_reloc()
+        self._load_tls()
+        self._perform_reloc(self.main_bin)
+        self._finalize_tls()
 
     def __repr__(self):
         return '<Loaded %s, maps [%#x:%#x]>' % (os.path.basename(self._main_binary_path), self.min_addr(), self.max_addr())
 
+    def get_initializers(self):
+        '''
+         Return a list of all the initializers that should be run before execution reaches
+         the entry point, in the order they should be run.
+        '''
+        return sum(map(lambda x: x.get_initializers(), self.all_objects), [])
+
+    def get_finalizers(self):
+        '''
+         Return a list of all the finalizers that should be run before the program exits.
+         I'm not sure what order they should be run in.
+        '''
+        return sum(map(lambda x: x.get_initializers(), self.all_objects), [])
+
+    @property
+    def linux_loader_object(self):
+        for obj in self.all_objects:
+            if obj.provides is None:
+                continue
+            if 'ld.so' in obj.provides or 'ld64.so' in obj.provides or 'ld-linux' in obj.provides:
+                return obj
+        return None
+
     def _load_main_binary(self):
-        self.main_bin = self.load_object(self._main_binary_path, self._main_opts)
+        self.main_bin = self.load_object(self._main_binary_path, self._main_opts, is_main_bin=True)
         self.memory = Clemory(self.main_bin.arch, root=True)
-        base_addr = self._main_opts.get('custom_base_addr', 0)
-        if base_addr == 0 and self.main_bin.requested_base is not None:
+        base_addr = self._main_opts.get('custom_base_addr', None)
+        if base_addr is None and self.main_bin.requested_base is not None:
             base_addr = self.main_bin.requested_base
+        if base_addr is None and self.main_bin.pic:
+            base_addr = 0x400000
+        if base_addr is None:
+            base_addr = 0
         self.add_object(self.main_bin, base_addr)
 
     def _load_dependencies(self):
@@ -120,21 +153,27 @@ class Loader(object):
             self.shared_objects[obj.provides] = obj
 
     @staticmethod
-    def load_object(path, options=None, compatible_with=None):
+    def load_object(path, options=None, compatible_with=None, is_main_bin=False):
+        # Try to find the filetype of the object. Also detect if you were given a bad filepath
         try:
             filetype = Loader.identify_object(path)
         except OSError:
             raise CLEFileNotFoundError('File %s does not exist!' % path)
 
+        # Verify that that filetype is acceptable
         if compatible_with is not None and filetype != compatible_with.filetype:
             raise CLECompatibilityError('File %s is not compatible with %s' % (path, compatible_with))
 
+        # Check if the user specified a backend as...
         backend_option = options.get('backend', None)
         if isinstance(backend_option, type) and issubclass(backend_option, AbsObj):
+            # ...an actual backend class
             backends = [backend_option]
         elif backend_option in BACKENDS:
+            # ...the name of a backend class
             backends = [BACKENDS[backend_option]]
         elif isinstance(backend_option, (list, tuple)):
+            # ...a list of backends containing either names or classes
             backends = []
             for backend_option_item in backend_option:
                 if isinstance(backend_option_item, type) and issubclass(backend_option_item, AbsObj):
@@ -154,7 +193,7 @@ class Loader(object):
 
         for backend in backends:
             try:
-                loaded = backend(path, compatible_with=compatible_with, filetype=filetype, **options)
+                loaded = backend(path, compatible_with=compatible_with, filetype=filetype, is_main_bin=is_main_bin, **options)
                 return loaded
             except CLECompatibilityError:
                 raise
@@ -168,7 +207,7 @@ class Loader(object):
          Returns the filetype of the file at path. Will be one of the strings
          in {'elf', 'pe', 'mach-o', 'unknown'}
         '''
-        identstring = open(path).read(0x1000)
+        identstring = open(path, 'rb').read(0x1000)
         if identstring.startswith('\x7fELF'):
             return 'elf'
         elif identstring.startswith('MZ') and len(identstring) > 0x40:
@@ -180,6 +219,8 @@ class Loader(object):
              identstring.startswith('\xce\xfa\xed\xfe') or \
              identstring.startswith('\xcf\xfa\xed\xfe'):
             return 'mach-o'
+        elif identstring.startswith('\x7fCGC'):
+            return 'cgc'
         return 'unknown'
 
     def add_object(self, obj, base_addr=None):
@@ -226,14 +267,22 @@ class Loader(object):
                             yield os.path.realpath(os.path.join(libdir, libname))
                 except OSError: pass
 
-    def _perform_reloc(self):
-        for i, obj in enumerate(self.all_objects):
-            obj.tls_module_id = i
-            if isinstance(obj, IDABin):
-                pass
-            elif isinstance(obj, (MetaELF, PE)):
-                for reloc in obj.relocs:
-                    reloc.relocate(self.all_objects)
+    def _perform_reloc(self, obj):
+        if obj.binary in self._relocated_objects:
+            return
+        self._relocated_objects.add(obj.binary)
+
+        for dep_name in obj.deps:
+            if dep_name not in self.shared_objects:
+                continue
+            dep_obj = self.shared_objects[dep_name]
+            self._perform_reloc(dep_obj)
+
+        if isinstance(obj, IDABin):
+            pass
+        elif isinstance(obj, (MetaELF, PE)):
+            for reloc in obj.relocs:
+                reloc.relocate(self.all_objects)
 
     def _get_safe_rebase_addr(self):
         """
@@ -245,23 +294,57 @@ class Loader(object):
         granularity = self._rebase_granularity
         return self.max_addr() + (granularity - self.max_addr() % granularity)
 
+    def _load_tls(self):
+        '''
+         Set up an object to store TLS data in
+        '''
+        modules = []
+        for obj in self.all_objects:
+            if not isinstance(obj, MetaELF):
+                continue
+            if not obj.tls_used:
+                continue
+            modules.append(obj)
+        if len(modules) == 0:
+            return
+        self.tls_object = TLSObj(modules)
+        self.add_object(self.tls_object)
+
+    def _finalize_tls(self):
+        '''
+         Lay out the TLS initialization images into memory
+        '''
+        if self.tls_object is not None:
+            self.tls_object.finalize()
+
     def addr_belongs_to_object(self, addr):
         for obj in self.all_objects:
-            if addr - obj.rebase_addr in obj.memory:
+            if not (addr >= obj.get_min_addr() and addr < obj.get_max_addr()):
+                continue
+
+            if type(obj.memory) is str:
                 return obj
+
+            elif isinstance(obj.memory, Clemory):
+                if addr - obj.rebase_addr in obj.memory:
+                    return obj
+
+            else:
+                raise CLEError('Unsupported memory type %s' % type(obj.memory))
+
         return None
 
     def max_addr(self):
         """ The maximum address loaded as part of any loaded object
         (i.e., the whole address space)
         """
-        return max(map(lambda x: x.get_max_addr() + x.rebase_addr, self.all_objects))
+        return max(map(lambda x: x.get_max_addr(), self.all_objects))
 
     def min_addr(self):
         """ The minimum address loaded as part of any loaded object
         i.e., the whole address space)
         """
-        return min(map(lambda x: x.get_min_addr() + x.rebase_addr, self.all_objects))
+        return min(map(lambda x: x.get_min_addr(), self.all_objects))
 
     # Search functions
 
@@ -398,7 +481,7 @@ class Loader(object):
 
         # Let's work on a copy of the main binary
         copy = self._make_tmp_copy(path, suffix=".screwed")
-        f = open(copy, 'r+')
+        f = open(copy, 'r+b')
 
         # Looking at elf.h, we can see that the the entry point's
         # definition is always at the same place for all architectures.
@@ -437,10 +520,14 @@ from .cleextractor import CLEExtractor
 from .pe import PE
 from .idabin import IDABin
 from .blob import Blob
+from .cgc import CGC
+from .backedcgc import BackedCGC
 
 BACKENDS = OrderedDict((
     ('elf', ELF),
     ('pe', PE),
+    ('cgc', CGC),
+    ('backedcgc', BackedCGC),
     ('cleextract', CLEExtractor),
     ('ida', IDABin),
     ('blob', Blob)

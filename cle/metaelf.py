@@ -11,29 +11,32 @@ class MetaELF(AbsObj):
     def __init__(self, *args, **kwargs):
         super(MetaELF, self).__init__(*args, **kwargs)
 
-        self.plt = {}
+        self._plt = {}
         self.elfflags = 0
+        self.ppc64_initial_rtoc = None
 
     supported_filetypes = ['elf']
 
     def _load_plt(self):
-        if self.arch.name in ('ARMEL', 'ARMHF', 'MIPS32'):
+        if self.arch.name in ('ARMEL', 'ARMHF', 'ARM', 'AARCH64', 'MIPS32', 'MIPS64'):
             return
 
         for name in self.jmprel:
             #FIXME: shouldn't we use get_call_stub_addr(name) instead ??
             addr = self._get_plt_stub_addr(name)
-            self.plt[name] = addr
+            self._plt[name] = addr
 
     def _get_plt_stub_addr(self, name):
         """
         Guess the address of the PLT stub for function @name.
         Functions must have a know GOT entry in self.jmprel
 
+        It should be safe to call regardless of if you've resolved simprocedures
+        or not, since those modifications are on the root clemory, and we're manipulating
+        one of its backers here.
+
         NOTE: you probably want to call get_call_stub_addr() instead.
         TODO: sections fallback for statically linked binaries
-        WARNING: call this after loading the binary image, but *before* resolving
-        SimProcedures.
         """
         if name not in self.jmprel.keys():
             return None
@@ -49,14 +52,18 @@ class MetaELF(AbsObj):
             # 0x6 is the size of the plt's jmpq instruction in x86_64
             return addr - 0x6
 
-        elif self.arch.name in ('ARMEL', 'ARMHF'):
+        elif self.arch.name in ('ARMEL', 'ARMHF', 'ARM', 'AARCH64'):
             return addr
 
         elif self.arch.name in ('PPC32', 'PPC64'):
             return got
 
-        elif self.arch.name == 'MIPS32':
+        elif self.arch.name in ('MIPS32', 'MIPS64'):
             return addr
+
+    @property
+    def plt(self):
+        return {k: v + self.rebase_addr for (k, v) in self._plt.items()}
 
     def get_call_stub_addr(self, name):
         """
@@ -64,11 +71,15 @@ class MetaELF(AbsObj):
         """
         # FIXME: this doesn't work on PPC. It will return .plt address of the
         # function, but it is not what is called in practice...
-        if self.arch.name in ('ARMEL', 'ARMHF', 'PPC32', 'PPC64'):
+        if self.arch.name in ('ARMEL', 'ARMHF', 'ARM', 'AARCH64', 'PPC32', 'PPC64'):
             raise CLEOperationError("FIXME: this doesn't work on PPC/ARM")
 
-        if name in self.plt.keys():
-            return self.plt[name]
+        if name in self._plt.keys():
+            return self._plt[name] + self.rebase_addr
+
+    @property
+    def is_ppc64_abiv1(self):
+        return self.arch.name == 'PPC64' and self.elfflags & 3 < 2
 
     def _ppc64_abiv1_entry_fix(self):
         """
@@ -80,8 +91,7 @@ class MetaELF(AbsObj):
         Utter bollocks, but this function should fix it.
         """
 
-        if self.arch.name != 'PPC64': return
-        if self.elfflags & 3 < 2:
+        if self.is_ppc64_abiv1:
             ep_offset = self._entry
             self._entry = self.memory.read_addr_at(ep_offset)
             self.ppc64_initial_rtoc = self.memory.read_addr_at(ep_offset+8)

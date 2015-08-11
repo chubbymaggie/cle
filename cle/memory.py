@@ -45,9 +45,29 @@ class Clemory(object):
             raise TypeError("Data must be a string or a Clemory")
         for i, (oldstart, _) in enumerate(self._backers):
             if oldstart == start:
-                self._updates[i] = (start, data)
+                self._backers[i] = (start, data)
                 self._needs_flattening_personal = True
                 break
+        else:
+            raise ValueError("Can't find backer to update")
+
+    def remove_backer(self, start):
+        for i, (oldstart, _) in enumerate(self._backers):
+            if oldstart == start:
+                self._backers.pop(i)
+                self._needs_flattening_personal = True
+                break
+        else:
+            raise ValueError("Can't find backer to remove")
+
+    def __iter__(self):
+        for start, string in self._backers:
+            if isinstance(string, str):
+                for x in xrange(len(string)):
+                    yield start + x
+            else:
+                for x in string:
+                    yield start + x
 
     def __getitem__(self, k):
         if k in self._updates:
@@ -78,24 +98,12 @@ class Clemory(object):
             return False
 
     def __getstate__(self):
-        out = { 'updates': {k:ord(v) for k,v in self._updates.iteritems()}, 'backers': [] }
-        for start, data in self._backers:
-            if isinstance(data, str):
-                out['backers'].append((start, {'type': 'str', 'data': data}))
-            elif isinstance(data, Clemory):
-                out['backers'].append((start, {'type': 'Clemory', 'data': data.__getstate__()}))
-
-    def __setstate__(self, s):
-        self._updates = {k:chr(v) for k,v in s['updates'].iteritems()}
-        self._backers = []
-        for start, serialdata in s['backers']:
-            if serialdata['type'] == 'str':
-                self._backers.append((start, serialdata['data']))
-            elif serialdata['type'] == 'Clemory':
-                subdata = Clemory(self._arch)
-                subdata.__setstate__(serialdata['data'])
-                self._backers.append((start, subdata))
+        self._cbackers = [ ]
         self._needs_flattening_personal = True
+        return self.__dict__
+
+    def __setstate__(self, data):
+        self.__dict__.update(data)
 
     def read_bytes(self, addr, n):
         """ Read @n bytes at address @addr in memory and return an array of bytes
@@ -112,6 +120,62 @@ class Clemory(object):
         for i, c in enumerate(data):
             self[addr+i] = c
 
+    def write_bytes_to_backer(self, addr, data):
+        """
+        Write bytes from @data at address @addr to backer instead of self._updates
+        This is only needed when writing a huge amount of data
+        """
+
+        pos = addr
+        to_insert = [ ]
+        i = 0
+
+        while i < len(self._backers) and len(data):
+            start, backer_data = self._backers[i] # self._backers is always sorted
+            size = len(backer_data)
+            stop = start + size
+            if pos >= start:
+                if pos < stop:
+                    if pos + len(data) > stop:
+                        new_backer_data = backer_data[ : pos - start] + data[ : stop - pos]
+                        self._backers[i] = (start, new_backer_data)
+
+                        # slicing data
+                        data = data[ stop - pos : ]
+                        pos = stop
+                    else:
+                        new_backer_data = backer_data[ : pos - start] + data + backer_data[pos - start + len(data) : ]
+                        self._backers[i] = (start, new_backer_data)
+                        # We are done
+                        break
+                i += 1
+            else:
+                # Look forward and see if we should insert a new backer
+                if i < len(self._backers) - 1:
+                    if pos + len(data) <= start:
+                        to_insert.append((pos, data[ : start - pos]))
+
+                        data = data[start - pos : ]
+                        pos = start
+
+                    else:
+                        # we reach the end of our data to insert
+                        to_insert.append((pos, data))
+
+                        break
+                else:
+                    # seems we reach the end of the list...
+                    to_insert.append((pos, data))
+
+                    break
+
+        # Insert the blocks that are needed to insert into self._backers
+        for seg_start, seg_data in to_insert:
+            bisect.insort(self._backers, (seg_start, seg_data))
+
+        # Set the flattening_needed flag
+        self._needs_flattening_personal = True
+
     def read_addr_at(self, where):
         """
         Read addr stored in memory as a serie of bytes starting at @where
@@ -123,7 +187,7 @@ class Clemory(object):
         Writes @addr into a serie of bytes in memory at @where
         @archinfo is an cle.Archinfo instance
         """
-        by = struct.pack(self._arch.struct_fmt(), addr)
+        by = struct.pack(self._arch.struct_fmt(), addr % (2**self._arch.bits))
         self.write_bytes(where, by)
 
     @property
