@@ -30,7 +30,7 @@ class Loader(object):
        tls_object         An object dealing with the region of memory allocated for thread-local storage
 
     When reference is made to a dictionary of options, it require a dictionary with zero or more of the following keys:
-        backend             "elf", "cleextract", "pe", "ida", "blob": which loader backend to use
+        backend             "elf", "pe", "ida", "blob": which loader backend to use
         custom_arch         The archinfo.Arch object to use for the binary
         custom_base_addr    The address to rebase the object at
         custom_entry_point  The entry point to use for the object
@@ -322,7 +322,7 @@ class Loader(object):
             if not (addr >= obj.get_min_addr() and addr < obj.get_max_addr()):
                 continue
 
-            if type(obj.memory) is str:
+            if isinstance(obj.memory, str):
                 return obj
 
             elif isinstance(obj.memory, Clemory):
@@ -356,15 +356,14 @@ class Loader(object):
                 return so.symbols_by_addr[addr - so.rebase_addr].name
         return None
 
-    def guess_function_name(self, addr):
+    def find_plt_stub_name(self, addr):
+        """ Return the name of the PLT stub starting at addr.
         """
-        Try to guess the name of the function at @addr
-        WARNING: this is approximate
-        """
-        for o in self.all_objects:
-            name = o.guess_function_name(addr)
-            if name is not None:
-                return name
+        for so in self.all_objects:
+            if isinstance(so, MetaELF):
+                if addr in so.reverse_plt:
+                    return so.reverse_plt[addr]
+        return None
 
     def find_module_name(self, addr):
         for o in self.all_objects:
@@ -516,7 +515,6 @@ class Loader(object):
 from .absobj import AbsObj
 from .elf import ELF
 from .metaelf import MetaELF
-from .cleextractor import CLEExtractor
 from .pe import PE
 from .idabin import IDABin
 from .blob import Blob
@@ -528,7 +526,6 @@ BACKENDS = OrderedDict((
     ('pe', PE),
     ('cgc', CGC),
     ('backedcgc', BackedCGC),
-    ('cleextract', CLEExtractor),
     ('ida', IDABin),
     ('blob', Blob)
 ))
