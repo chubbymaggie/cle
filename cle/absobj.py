@@ -223,7 +223,11 @@ class Relocation(object):
     def reloc_absolute(self, solist):
         if not self.resolve_symbol(solist):
             return False
-        self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.rebased_addr)
+        if self.addend < 0x100:
+            # HORRIBLE AWFUL HACK PLEASE BURN IT
+            self.owner_obj.memory.write_addr_at(self.addr, self.addend + self.resolvedby.rebased_addr)
+        else:
+            self.owner_obj.memory.write_addr_at(self.addr, self.resolvedby.rebased_addr)
         return True
 
     def reloc_relative(self):
@@ -298,6 +302,12 @@ class Relocation(object):
             symbol = so.get_symbol(self.symbol.name)
             if symbol is not None and symbol.is_export:
                 if symbol.binding == 'STB_GLOBAL':
+                    self.resolve(symbol)
+                    return True
+                elif weak_result is None:
+                    weak_result = symbol
+            elif symbol is not None and not symbol.is_import and so is self.owner_obj:
+                if not symbol.is_weak:
                     self.resolve(symbol)
                     return True
                 elif weak_result is None:
