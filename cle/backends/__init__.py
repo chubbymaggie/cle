@@ -2,6 +2,7 @@ from collections import OrderedDict as _ordered_dict
 import os
 
 import archinfo
+import subprocess
 from ..errors import CLECompatibilityError, CLEError
 from ..memory import Clemory
 
@@ -94,6 +95,12 @@ class Symbol(object):
         self.resolvedby = None
         if self.addr != 0:
             self.owner_obj.symbols_by_addr[self.addr] = self
+            # would be nice if we could populate demangled_names here...
+            '''
+            demangled = self.demangled_name
+            if demangled is not None:
+                self.owner_obj.demangled_names[self.name] = demangled
+            '''
 
     def resolve(self, obj):
         self.resolved = True
@@ -123,6 +130,23 @@ class Symbol(object):
     def is_weak(self):
         return self.binding == 'STB_WEAK'
 
+    @property
+    def demangled_name(self):
+        # make sure it's mangled
+        if self.name.startswith("_Z"):
+            name = self.name
+            if '@@' in self.name:
+                name = self.name.split("@@")[0]
+            args = ['c++filt']
+            args.append(name)
+            pipe = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            stdout, _ = pipe.communicate()
+            demangled = stdout.split("\n")
+
+            if len(demangled) > 0:
+                return demangled[0]
+
+        return None
 
 class Backend(object):
     """
@@ -144,6 +168,7 @@ class Backend(object):
         self.imports = {}
         self.resolved_imports = []
         self.relocs = []
+        self.irelatives = []    # list of tuples (resolver, destination), dest w/o rebase
         self.jmprel = {}
         self.arch = None
         self.filetype = filetype
@@ -285,6 +310,7 @@ class Backend(object):
         return None
 
 from .elf import ELF
+from .elfcore import ELFCore
 from .pe import PE
 from .idabin import IDABin
 from .blob import Blob
@@ -294,6 +320,7 @@ from .metaelf import MetaELF
 
 ALL_BACKENDS = _ordered_dict((
     ('elf', ELF),
+    ('elfcore', ELFCore),
     ('pe', PE),
     ('cgc', CGC),
     ('backedcgc', BackedCGC),

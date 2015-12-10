@@ -1,9 +1,11 @@
 import struct
+import subprocess
 from elftools.elf import elffile, sections
+from elftools.common.exceptions import ELFError
 import archinfo
 
 from ..backends import Symbol, Segment, Section
-from ..errors import CLEError, CLEInvalidBinaryError
+from ..errors import CLEError, CLEInvalidBinaryError, CLECompatibilityError
 from .metaelf import MetaELF
 from ..relocations import get_relocation
 from ..relocations.generic import MipsGlobalReloc, MipsLocalReloc
@@ -63,7 +65,10 @@ class ELF(MetaELF):
     '''
     def __init__(self, binary, **kwargs):
         super(ELF, self).__init__(binary, **kwargs)
-        self.reader = elffile.ELFFile(open(self.binary, 'rb'))
+        try:
+            self.reader = elffile.ELFFile(open(self.binary, 'rb'))
+        except ELFError:
+            raise CLECompatibilityError
 
         # Get an appropriate archinfo.Arch for this binary, unless the user specified one
         if self.arch is None:
@@ -95,6 +100,7 @@ class ELF(MetaELF):
 
         self._symbol_cache = {}
         self.symbols_by_addr = {}
+        self.demangled_names = {}
         self.imports = {}
         self.resolved_imports = []
 
@@ -117,6 +123,8 @@ class ELF(MetaELF):
         # call the methods defined by MetaELF
         self._ppc64_abiv1_entry_fix()
         self._load_plt()
+
+        self._populate_demangled_names()
 
     def __getstate__(self):
         self.reader = None
@@ -422,13 +430,14 @@ class ELF(MetaELF):
     def __relocate_mips(self):
         if 'DT_MIPS_BASE_ADDRESS' not in self._dynamic:
             return False
+        # The MIPS GOT is an array of addresses, simple as that.
         got_local_num = self._dynamic['DT_MIPS_LOCAL_GOTNO'] # number of local GOT entries
         # a.k.a the index of the first global GOT entry
         symtab_got_idx = self._dynamic['DT_MIPS_GOTSYM']   # index of first symbol w/ GOT entry
         symbol_count = self._dynamic['DT_MIPS_SYMTABNO']
         gotaddr = self._dynamic['DT_PLTGOT']
         wordsize = self.arch.bytes
-        for i in range(got_local_num):
+        for i in range(2, got_local_num):
             reloc = MipsLocalReloc(self, None, gotaddr + i*wordsize)
             self.relocs.append(reloc)
 
@@ -438,6 +447,25 @@ class ELF(MetaELF):
             self.relocs.append(reloc)
             self.jmprel[symbol.name] = reloc
         return True
+
+    def _populate_demangled_names(self):
+        '''
+        TODO: remove this once a python implementation of a name demangler has
+        been implemented, then update self.demangled_names in Symbol
+        '''
+
+        names = [self.symbols_by_addr[s].name for s in self.symbols_by_addr]
+        names = filter(lambda n: n.startswith("_Z"), names)
+        lookup_names = map(lambda n: n.split("@@")[0], names)
+        # this monstrosity taken from stackoverflow
+        # http://stackoverflow.com/questions/6526500/c-name-mangling-library-for-python
+        args = ['c++filt']
+        args.extend(lookup_names)
+        pipe = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        stdout, _ = pipe.communicate()
+        demangled = stdout.split("\n")[:-1]
+
+        self.demangled_names = dict(zip(names, demangled))
 
 class ELFHashTable(object):
     """

@@ -239,10 +239,12 @@ class Loader(object):
     def identify_object(path):
         '''
          Returns the filetype of the file at path. Will be one of the strings
-         in {'elf', 'pe', 'mach-o', 'unknown'}
+         in {'elf', 'elfcore', 'pe', 'mach-o', 'unknown'}
         '''
         identstring = open(path, 'rb').read(0x1000)
         if identstring.startswith('\x7fELF'):
+            if elftools.elf.elffile.ELFFile(open(path, 'rb')).header['e_type'] == 'ET_CORE':
+                return 'elfcore'
             return 'elf'
         elif identstring.startswith('MZ') and len(identstring) > 0x40:
             peptr = struct.unpack('I', identstring[0x3c:0x40])[0]
@@ -378,14 +380,15 @@ class Loader(object):
 
         off = addr - o.rebase_addr
 
-        if addr in o.plt.values():
-            for k,v in o.plt.iteritems():
-                if v == addr:
-                    return  "PLT stub of %s in %s (offset %#x)" % (k, o.provides, off)
+        if isinstance(o, ELF):
+            if addr in o.plt.values():
+                for k,v in o.plt.iteritems():
+                    if v == addr:
+                        return  "PLT stub of %s in %s (offset %#x)" % (k, o.provides, off)
 
-        if off in o.symbols_by_addr:
-            name = o.symbols_by_addr[off].name
-            return "%s (offset %#x) in %s" % (name, off, o.provides)
+            if off in o.symbols_by_addr:
+                name = o.symbols_by_addr[off].name
+                return "%s (offset %#x) in %s" % (name, off, o.provides)
 
         return "Offset %#x in %s" % (off, o.provides)
 
@@ -641,10 +644,15 @@ class Loader(object):
             raise CLEError("Invalid path: %s" % path)
 
         f = open(path, 'rb')
-        e = elftools.elf.elffile.ELFFile(f)
-        dyn = e.get_section_by_name('.dynamic')
-        soname = [ x.soname for x in list(dyn.iter_tags()) if x.entry.d_tag == 'DT_SONAME']
-        return soname[0]
+        try:
+            e = elftools.elf.elffile.ELFFile(f)
+            dyn = e.get_section_by_name('.dynamic')
+            soname = [ x.soname for x in list(dyn.iter_tags()) if x.entry.d_tag == 'DT_SONAME']
+            return soname[0]
+        except elftools.common.exceptions.ELFError:
+            return None
+        finally:
+            f.close()
 
     def _check_compatibility(self, path):
         """
@@ -685,6 +693,17 @@ class Loader(object):
             if k in dest and v in dest[k]:
                 raise CLEError("%s/%s is overriden by gdb's" % (k,v))
         return dict(opts.items() + dest.items())
+
+    @property
+    def all_elf_objects(self):
+        return [o for o in self.all_objects if type(o) is ELF]
+
+    def perform_irelative_relocs(self, resolver_func):
+        for obj in self.all_objects:
+            for resolver, dest in obj.irelatives:
+                val = resolver_func(resolver)
+                if val is not None:
+                    obj.memory.write_addr_at(dest, val)
 
 from .errors import CLEError, CLEOperationError, CLEFileNotFoundError, CLECompatibilityError
 from .memory import Clemory
