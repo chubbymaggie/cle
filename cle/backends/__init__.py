@@ -63,16 +63,30 @@ class Segment(Region):
     pass
 
 class Section(Region):
-    """ Simple representation of an ELF file section"""
-    def __init__(self, name, offset, vaddr, size, sectype, entsize, flags, link, info, align):
+    """ Simple representation of a section"""
+    def __init__(self, name, offset, vaddr, size):
         super(Section, self).__init__(offset, vaddr, size, size)
         self.name = name
-        self.type = sectype
-        self.entsize = entsize
-        self.flags = flags
-        self.link = link
-        self.info = info
-        self.align = align
+
+    @property
+    def is_readable(self):
+        raise NotImplementedError()
+
+    @property
+    def is_writable(self):
+        raise NotImplementedError()
+
+    @property
+    def is_readable(self):
+        raise NotImplementedError()
+
+    def __repr__(self):
+        return "<%s | offset %#x, vaddr %#x, size %#x>" % (
+            self.name if self.name else "Unnamed",
+            self.offset,
+            self.vaddr,
+            self.memsize
+        )
 
 class Symbol(object):
     """
@@ -174,6 +188,7 @@ class Backend(object):
         self.filetype = filetype
         self.os = 'windows' if self.filetype == 'pe' else 'unix'
         self.compatible_with = compatible_with
+        self._symbol_cache = {}
 
         # These are set by cle, and should not be overriden manually
         self.rebase_addr = 0 # not to be set manually - used by CLE
@@ -230,17 +245,21 @@ class Backend(object):
                 return True
         return False
 
-    def find_segment_containing(self, vaddr):
-        """ Returns the segment that contains @vaddr, or None """
+    def find_segment_containing(self, addr):
+        """ Returns the segment that contains @addr, or None """
         for s in self.segments:
-            if s.contains_addr(vaddr - self.rebase_addr):
+            if s.contains_addr(addr - self.rebase_addr):
                 return s
 
-    def find_section_containing(self, vaddr):
-        """ Returns the section that contains @vaddr, or None """
+        return None
+
+    def find_section_containing(self, addr):
+        """ Returns the section that contains @addr, or None """
         for s in self.sections:
-            if s.contains_addr(vaddr - self.rebase_addr):
+            if s.contains_addr(addr - self.rebase_addr):
                 return s
+
+        return None
 
     def addr_to_offset(self, addr):
         for s in self.segments:
@@ -262,6 +281,12 @@ class Backend(object):
         for segment in self.segments:
             if out is None or segment.min_addr < out:
                 out = segment.min_addr
+
+        if out is None:
+            for section in self.sections:
+                if out is None or section.min_addr < out:
+                    out = section.min_addr
+
         return out + self.rebase_addr
 
     def get_max_addr(self):
@@ -273,6 +298,12 @@ class Backend(object):
         for segment in self.segments:
             if out is None or segment.max_addr > out:
                 out = segment.max_addr
+
+        if out is None:
+            for section in self.sections:
+                if out is None or section.max_addr > out:
+                    out = section.max_addr
+
         return out + self.rebase_addr
 
     def set_got_entry(self, symbol_name, newaddr):
@@ -307,6 +338,8 @@ class Backend(object):
         '''
          Stub function. Implement to find the symbol with name `name`.
         '''
+        if name in self._symbol_cache:
+            return self._symbol_cache[name]
         return None
 
 from .elf import ELF
