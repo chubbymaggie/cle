@@ -1,5 +1,6 @@
 import struct
 import subprocess
+from collections import OrderedDict
 from elftools.elf import elffile, sections
 from elftools.common.exceptions import ELFError
 import archinfo
@@ -9,13 +10,18 @@ from ..errors import CLEError, CLEInvalidBinaryError, CLECompatibilityError
 from .metaelf import MetaELF
 from ..relocations import get_relocation
 from ..relocations.generic import MipsGlobalReloc, MipsLocalReloc
+from ..patched_stream import PatchedStream
 
 import logging
 l = logging.getLogger('cle.elf')
 
 __all__ = ('ELFSymbol', 'ELF')
 
+
 class ELFSymbol(Symbol):
+    """
+    Represents a symbol for the ELF format.
+    """
     def __init__(self, owner, symb):
         realtype = owner.arch.translate_symbol_type(symb.entry.st_info.type)
         super(ELFSymbol, self).__init__(owner,
@@ -26,7 +32,11 @@ class ELFSymbol(Symbol):
                                         realtype,
                                         symb.entry.st_shndx)
 
+
 class ELFSegment(Segment):
+    """
+    Represents a segment for the ELF format.
+    """
     def __init__(self, readelf_seg):
         self.flags = readelf_seg.header.p_flags
         super(ELFSegment, self).__init__(readelf_seg.header.p_offset,
@@ -45,6 +55,7 @@ class ELFSegment(Segment):
     @property
     def is_executable(self):
         return self.flags & 1 != 0
+
 
 class ELFSection(Section):
     SHF_WRITE = 0x1
@@ -68,6 +79,10 @@ class ELFSection(Section):
         self.align = readelf_sec.header.sh_addralign
 
     @property
+    def is_readable(self):
+        return True
+
+    @property
     def is_writable(self):
         return self.flags & self.SHF_WRITE != 0
 
@@ -83,29 +98,46 @@ class ELFSection(Section):
     def is_strings(self):
         return self.flags & self.SHF_STRINGS != 0
 
+
 class ELF(MetaELF):
-    '''
-     The main loader class for statically loading elves. Uses the pyreadelf library where useful.
-    '''
+    """
+    The main loader class for statically loading ELF executables. Uses the pyreadelf library where useful.
+    """
     def __init__(self, binary, **kwargs):
         super(ELF, self).__init__(binary, **kwargs)
+
+        patch_undo = None
         try:
-            self.reader = elffile.ELFFile(open(self.binary, 'rb'))
+            self.reader = elffile.ELFFile(self.binary_stream)
         except ELFError:
-            raise CLECompatibilityError
+            self.binary_stream.seek(5)
+            ty = self.binary_stream.read(1)
+            if ty not in ('\1', '\2'):
+                raise CLECompatibilityError
+
+            patch_data = (0x20, '\0\0\0\0') if ty == '\1' else (0x28, '\0\0\0\0\0\0\0\0')
+            self.binary_stream.seek(patch_data[0])
+            patch_undo = (patch_data[0], self.binary_stream.read(len(patch_data[1])))
+            self.binary_stream = PatchedStream(self.binary_stream, [patch_data])
+            l.error("PyReadELF couldn't load this file. Trying again without section headers...")
+
+            try:
+                self.reader = elffile.ELFFile(self.binary_stream)
+            except ELFError:
+                raise CLECompatibilityError
 
         # Get an appropriate archinfo.Arch for this binary, unless the user specified one
         if self.arch is None:
-            if self.reader.header.e_machine == 'EM_ARM' and \
-                    self.reader.header.e_flags & 0x200:
-                self.set_arch(archinfo.ArchARMEL('Iend_LE' if 'LSB' in self.reader.header.e_ident.EI_DATA else 'Iend_BE'))
-            elif self.reader.header.e_machine == 'EM_ARM' and \
-                    self.reader.header.e_flags & 0x400:
-                self.set_arch(archinfo.ArchARMHF('Iend_LE' if 'LSB' in self.reader.header.e_ident.EI_DATA else 'Iend_BE'))
+            arch_str = self.reader['e_machine']
+            if arch_str == 'ARM':
+                if self.reader.header.e_flags & 0x200:
+                    self.set_arch(archinfo.ArchARMEL('Iend_LE' if self.reader.little_endian else 'Iend_BE'))
+                elif self.reader.header.e_flags & 0x400:
+                    self.set_arch(archinfo.ArchARMHF('Iend_LE' if self.reader.little_endian else 'Iend_BE'))
             else:
-                self.set_arch(archinfo.arch_from_id(self.reader.header.e_machine,
-                                                self.reader.header.e_ident.EI_DATA,
-                                                self.reader.header.e_ident.EI_CLASS))
+                self.set_arch(archinfo.arch_from_id(arch_str,
+                                                'le' if self.reader.little_endian else 'be',
+                                                self.reader.elfclass))
 
         self.strtab = None
         self.dynsym = None
@@ -121,7 +153,7 @@ class ELF(MetaELF):
         self._init_arr = []
         self._fini_func = None
         self._fini_arr = []
-        self._nullsymbol = Symbol(self, '', 0, 0, None, 'STT_NONE', 0)
+        self._nullsymbol = Symbol(self, '', 0, 0, None, 'STT_NOTYPE', 0)
 
         self._symbol_cache = {}
         self.symbols_by_addr = {}
@@ -153,7 +185,16 @@ class ELF(MetaELF):
 
         self._populate_demangled_names()
 
+        if patch_undo is not None:
+            self.memory.write_bytes(self.get_min_addr() + patch_undo[0], patch_undo[1])
+
     def __getstate__(self):
+        if self.binary is None:
+            raise ValueError("Can't pickle an object loaded from a stream")
+        if type(self.binary_stream) is PatchedStream:
+            self.binary_stream.stream = None
+        else:
+            self.binary_stream = None
         self.reader = None
         self.strtab = None
         self.dynsym = None
@@ -162,7 +203,11 @@ class ELF(MetaELF):
 
     def __setstate__(self, data):
         self.__dict__.update(data)
-        self.reader = elffile.ELFFile(open(self.binary, 'rb'))
+        if self.binary_stream is None:
+            self.binary_stream = open(self.binary, 'rb')
+        else:
+            self.binary_stream.stream = open(self.binary, 'rb')
+        self.reader = elffile.ELFFile(self.binary_stream)
         if self._dynamic and 'DT_STRTAB' in self._dynamic:
             fakestrtabheader = {
                 'sh_offset': self._dynamic['DT_STRTAB']
@@ -180,11 +225,11 @@ class ELF(MetaELF):
                 elif 'DT_HASH' in self._dynamic:
                     self.hashtable = ELFHashTable(self.dynsym, self.memory, self._dynamic['DT_HASH'], self.arch)
 
-    def get_symbol(self, symid, symbol_table=None):
+    def get_symbol(self, symid, symbol_table=None): # pylint: disable=arguments-differ
         """
-        Gets a Symbol object for the specified symbol
+        Gets a Symbol object for the specified symbol.
 
-        @param symid: either an index into .dynsym or the name of a symbol.
+        :param symid: Either an index into .dynsym or the name of a symbol.
         """
         if symbol_table is None:
             symbol_table = self.dynsym
@@ -199,7 +244,7 @@ class ELF(MetaELF):
             symbol = ELFSymbol(self, re_sym)
             self._symbol_cache[re_sym.name] = symbol
             return symbol
-        elif isinstance(symid, str):
+        elif isinstance(symid, (str,unicode)):
             if symid in self._symbol_cache:
                 return self._symbol_cache[symid]
             if self.hashtable is None:
@@ -266,11 +311,13 @@ class ELF(MetaELF):
         return out
 
     def __register_segments(self):
+        self.linking = 'static'
         for seg_readelf in self.reader.iter_segments():
             if seg_readelf.header.p_type == 'PT_LOAD':
                 self._load_segment(seg_readelf)
             elif seg_readelf.header.p_type == 'PT_DYNAMIC':
                 self.__register_dyn(seg_readelf)
+                self.linking = 'dynamic'
             elif seg_readelf.header.p_type == 'PT_TLS':
                 self.__register_tls(seg_readelf)
             elif seg_readelf.header.p_type == 'PT_GNU_STACK':
@@ -280,9 +327,9 @@ class ELF(MetaELF):
         return addr + self.rebase_addr
 
     def _load_segment(self, seg):
-        '''
-         Loads a segment based on a LOAD directive in the program header table
-        '''
+        """
+        Loads a segment based on a LOAD directive in the program header table.
+        """
         self.segments.append(ELFSegment(seg))
         seg_data = seg.data()
         if seg.header.p_memsz > seg.header.p_filesz:
@@ -290,9 +337,9 @@ class ELF(MetaELF):
         self.memory.add_backer(seg.header.p_vaddr, seg_data)
 
     def __register_dyn(self, seg_readelf):
-        '''
-         Parse the dynamic section for dynamically linked objects
-        '''
+        """
+        Parse the dynamic section for dynamically linked objects.
+        """
         for tag in seg_readelf.iter_tags():
             # Create a dictionary, self._dynamic, mapping DT_* strings to their values
             tagstr = self.arch.translate_dynamic_tag(tag.entry.d_tag)
@@ -363,6 +410,9 @@ class ELF(MetaELF):
                 # try to parse relocations out of a table of type DT_REL{,A}
                 if 'DT_' + self.rela_type in self._dynamic:
                     reloffset = self._dynamic['DT_' + self.rela_type]
+                    if 'DT_' + self.rela_type + 'SZ' not in self._dynamic:
+                        raise CLEInvalidBinaryError('Dynamic section contains DT_' + self.rela_type +
+                                ', but DT_' + self.rela_type + 'SZ is not present')
                     relsz = self._dynamic['DT_' + self.rela_type + 'SZ']
                     fakerelheader = {
                         'sh_offset': reloffset,
@@ -376,6 +426,8 @@ class ELF(MetaELF):
                 # try to parse relocations out of a table of type DT_JMPREL
                 if 'DT_JMPREL' in self._dynamic:
                     jmpreloffset = self._dynamic['DT_JMPREL']
+                    if 'DT_PLTRELSZ' not in self._dynamic:
+                        raise CLEInvalidBinaryError('Dynamic section contains DT_JMPREL, but DT_PLTRELSZ is not present')
                     jmprelsz = self._dynamic['DT_PLTRELSZ']
                     fakejmprelheader = {
                         'sh_offset': jmpreloffset,
@@ -384,7 +436,7 @@ class ELF(MetaELF):
                         'sh_size': jmprelsz
                     }
                     readelf_jmprelsec = elffile.RelocationSection(fakejmprelheader, 'jmprel_cle', self.memory, self.reader)
-                    self.jmprel = {reloc.symbol.name: reloc for reloc in self.__register_relocs(readelf_jmprelsec)}
+                    self.jmprel = OrderedDict((reloc.symbol.name, reloc) for reloc in self.__register_relocs(readelf_jmprelsec) if reloc.symbol.name != '')
 
 
     def __register_relocs(self, section):
@@ -392,12 +444,13 @@ class ELF(MetaELF):
             return
         self.__parsed_reloc_tables.add(section.header['sh_offset'])
 
+        symtab = self.reader.get_section(section.header['sh_link']) if 'sh_link' in section.header else None
         relocs = []
         for readelf_reloc in section.iter_relocations():
             # MIPS64 is just plain old fucked up
             # https://www.sourceware.org/ml/libc-alpha/2003-03/msg00153.html
             if self.arch.name == 'MIPS64':
-                # Little endian addionally needs one of its fields reversed... WHY
+                # Little endian additionally needs one of its fields reversed... WHY
                 if self.arch.memory_endness == 'Iend_LE':
                     readelf_reloc.entry.r_info_sym = readelf_reloc.entry.r_info & 0xFFFFFFFF
                     readelf_reloc.entry.r_info = struct.unpack('>Q', struct.pack('<Q', readelf_reloc.entry.r_info))[0]
@@ -408,7 +461,7 @@ class ELF(MetaELF):
                 extra_sym = readelf_reloc.entry.r_info >> 24 & 0xFF
                 if extra_sym != 0:
                     l.error('r_info_extra_sym is nonzero??? PLEASE SEND HELP')
-                symbol = self.get_symbol(readelf_reloc.entry.r_info_sym)
+                symbol = self.get_symbol(readelf_reloc.entry.r_info_sym, symtab)
 
                 if type_1 != 0:
                     readelf_reloc.entry.r_info_type = type_1
@@ -429,7 +482,6 @@ class ELF(MetaELF):
                         relocs.append(reloc)
                         self.relocs.append(reloc)
             else:
-                symtab = self.reader.get_section(section.header['sh_link']) if 'sh_link' in section.header else None
                 symbol = self.get_symbol(readelf_reloc.entry.r_info_sym, symtab)
                 reloc = self._make_reloc(readelf_reloc, symbol)
                 if reloc is not None:
@@ -458,7 +510,8 @@ class ELF(MetaELF):
             self.sections_map[section.name] = section
             if isinstance(sec_readelf, elffile.SymbolTableSection):
                 self.__register_section_symbols(sec_readelf)
-            if isinstance(sec_readelf, elffile.RelocationSection):
+            if isinstance(sec_readelf, elffile.RelocationSection) and not \
+                    ('DT_REL' in self._dynamic or 'DT_RELA' in self._dynamic or 'DT_JMPREL' in self._dynamic):
                 self.__register_relocs(sec_readelf)
 
             if sec_readelf.header['sh_flags'] & 2:      # alloc flag - stick in memory maybe!
@@ -496,10 +549,13 @@ class ELF(MetaELF):
         return True
 
     def _populate_demangled_names(self):
-        '''
+        """
         TODO: remove this once a python implementation of a name demangler has
         been implemented, then update self.demangled_names in Symbol
-        '''
+        """
+
+        if not len(self.symbols_by_addr):
+            return
 
         names = [self.symbols_by_addr[s].name for s in self.symbols_by_addr]
         names = filter(lambda n: n.startswith("_Z"), names)
@@ -522,10 +578,10 @@ class ELFHashTable(object):
     """
     def __init__(self, symtab, stream, offset, arch):
         """
-        @param symtab       The symbol table to perform lookups from (as a pyelftools SymbolTableSection)
-        @param stream       A file-like object to read from the ELF's memory
-        @param offset       The offset in the object where the table starts
-        @param arch         The ArchInfo object for the ELF file
+        :param symtab:  The symbol table to perform lookups from (as a pyelftools SymbolTableSection).
+        :param stream:  A file-like object to read from the ELF's memory.
+        :param offset:  The offset in the object where the table starts.
+        :param arch:    The ArchInfo object for the ELF file.
         """
         self.symtab = symtab
         fmt = '<' if arch.memory_endness == 'Iend_LE' else '>'
@@ -538,7 +594,7 @@ class ELFHashTable(object):
         """
         Perform a lookup. Returns a pyelftools Symbol object, or None if there is no match.
 
-        @param k        The string to look up
+        :param k:   The string to look up.
         """
         hval = self.elf_hash(k) % self.nbuckets
         symndx = self.buckets[hval]
@@ -554,8 +610,8 @@ class ELFHashTable(object):
     def elf_hash(key):
         h = 0
         x = 0
-        for i in range(len(key)):
-            h = (h << 4) + ord(key[i])
+        for c in key:
+            h = (h << 4) + ord(c)
             x = h & 0xF0000000
             if x != 0:
                 h ^= (x >> 24)
@@ -570,10 +626,10 @@ class GNUHashTable(object):
     """
     def __init__(self, symtab, stream, offset, arch):
         """
-        @param symtab       The symbol table to perform lookups from (as a pyelftools SymbolTableSection)
-        @param stream       A file-like object to read from the ELF's memory
-        @param offset       The offset in the object where the table starts
-        @param arch         The ArchInfo object for the ELF file
+        :param symtab:       The symbol table to perform lookups from (as a pyelftools SymbolTableSection).
+        :param stream:       A file-like object to read from the ELF's memory.
+        :param offset:       The offset in the object where the table starts.
+        :param arch:         The ArchInfo object for the ELF file.
         """
         self.symtab = symtab
         fmt = '<' if arch.memory_endness == 'Iend_LE' else '>'
@@ -598,7 +654,7 @@ class GNUHashTable(object):
         """
         Perform a lookup. Returns a pyelftools Symbol object, or None if there is no match.
 
-        @param k        The string to look up
+        :param k:        The string to look up
         """
         h = self.gnu_hash(k)
         if not self._matches_bloom(h):

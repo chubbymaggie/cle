@@ -1,6 +1,7 @@
 from ..backends import Segment
 from .cgc import CGC
 
+
 class FakeSegment(Segment):
     def __init__(self, start, size):
         super(FakeSegment, self).__init__(0, start, 0, size)
@@ -8,22 +9,30 @@ class FakeSegment(Segment):
         self.is_writable = True
         self.is_executable = False
 
-class BackedCGC(CGC):
-    def __init__(self, path, memory_backer=None, register_backer=None, writes_backer=None, *args, **kwargs):
-        """
-        This is a backend for CGC executables that allows user provide a memory backer and a register backer as the
-        initial state of the running binary.
 
-        :param path: File path to CGC executable
-        :param memory_backer: A dict of memory content, with beginning address of each segment as key and actual memory
-                            content as data
-        :param register_backer: A dict of all register contents. EIP will be used as the entry point of this executable
+class BackedCGC(CGC):
+    """
+    This is a backend for CGC executables that allows user provide a memory backer and a register backer as the
+    initial state of the running binary.
+    """
+    def __init__(self, path, memory_backer=None, register_backer=None, writes_backer=None, permissions_map=None,
+                 current_allocation_base=None, *args, **kwargs):
+        """
+        :param path:                    File path to CGC executable.
+        :param memory_backer:           A dict of memory content, with beginning address of each segment as key and
+                                        actual memory content as data.
+        :param register_backer:         A dict of all register contents. EIP will be used as the entry point of this
+                                        executable.
+        :param permissions_map:         A dict of memory region to permission flags
+        :param current_allocation_base: An integer representing the current address of the top of the CGC heap.
         """
         super(BackedCGC, self).__init__(path, *args, **kwargs)
 
         self.memory_backer = memory_backer
         self.register_backer = register_backer
         self.writes_backer = writes_backer
+        self.permissions_map = permissions_map
+        self.current_allocation_base = current_allocation_base
 
         exec_seg_addr = None
         for seg in self.segments:

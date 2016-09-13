@@ -6,8 +6,11 @@ from ..errors import CLEError, CLECompatibilityError
 import logging
 l = logging.getLogger('cle.elfcore')
 
-class CoreNote(object):
 
+class CoreNote(object):
+    """
+    This class is used when parsing the NOTES section of a core file.
+    """
     n_type_lookup = {
             1: 'NT_PRSTATUS',
             2: 'NT_PRFPREG',
@@ -29,10 +32,11 @@ class CoreNote(object):
     def __repr__(self):
         return "<Note %s %s %#x>" % (self.name, self.n_type, len(self.desc))
 
+
 class ELFCore(ELF):
-    '''
-     Loader class for ELF core files.
-    '''
+    """
+    Loader class for ELF core files.
+    """
 
     def __init__(self, binary, **kwargs):
         super(ELFCore, self).__init__(binary, **kwargs)
@@ -75,10 +79,9 @@ class ELFCore(ELF):
         return self.registers.iteritems()
 
     def __extract_note_info(self):
-        '''
-        all meaningful information about the process's state at crashtime is stored in the note
-        segment
-        '''
+        """
+        All meaningful information about the process's state at crashtime is stored in the note segment.
+        """
         for seg_readelf in self.reader.iter_segments():
             if seg_readelf.header.p_type == 'PT_NOTE':
                 self.__parse_notes(seg_readelf)
@@ -87,9 +90,9 @@ class ELFCore(ELF):
             l.warning("Could not find note segment, cannot initialize registers")
 
     def __parse_notes(self, seg):
-        '''
-        this exists, because note parsing in elftools is not good.
-        '''
+        """
+        This exists, because note parsing in elftools is not good.
+        """
 
         blob = seg.data()
 
@@ -117,13 +120,14 @@ class ELFCore(ELF):
         self.__parse_prstatus(prstatus)
 
     def __parse_prstatus(self, prstatus):
-        '''
-        parse out the prstatus, accumulating the general purpose register values.
-        supports AMD64, X86, ARM, and AARCH64 at the moment.
-        TODO: support all architecutres angr supports
+        """
+        Parse out the prstatus, accumulating the general purpose register values. Supports AMD64, X86, ARM, and AARCH64
+        at the moment.
 
-        :param prstatus: a note object of type NT_PRSTATUS
-        '''
+        :param prstatus: a note object of type NT_PRSTATUS.
+        """
+
+        # TODO: support all architectures angr supports
 
         # extract siginfo from prstatus
         self.si_signo, self.si_code, self.si_errno = struct.unpack("<3I", prstatus.desc[:12])
@@ -149,19 +153,19 @@ class ELFCore(ELF):
         usec = struct.unpack("<" + fmt, prstatus.desc[pos:pos+arch_bytes])[0] * 1000
         self.pr_utime_usec = struct.unpack("<" + fmt, prstatus.desc[pos+arch_bytes:pos+arch_bytes*2])[0] + usec
 
-        pos = pos + arch_bytes*2
+        pos += arch_bytes * 2
         usec = struct.unpack("<" + fmt, prstatus.desc[pos:pos+arch_bytes])[0] * 1000
         self.pr_stime_usec = struct.unpack("<" + fmt, prstatus.desc[pos+arch_bytes:pos+arch_bytes*2])[0] + usec
 
-        pos = pos + arch_bytes*2
+        pos += arch_bytes * 2
         usec = struct.unpack("<" + fmt, prstatus.desc[pos:pos+arch_bytes])[0] * 1000
         self.pr_cutime_usec = struct.unpack("<" + fmt, prstatus.desc[pos+arch_bytes:pos+arch_bytes*2])[0] + usec
 
-        pos = pos + arch_bytes*2
+        pos += arch_bytes * 2
         usec = struct.unpack("<" + fmt, prstatus.desc[pos:pos+arch_bytes])[0] * 1000
         self.pr_cstime_usec = struct.unpack("<" + fmt, prstatus.desc[pos+arch_bytes:pos+arch_bytes*2])[0] + usec
 
-        pos = pos + arch_bytes*2
+        pos += arch_bytes * 2
 
         # parse out general purpose registers
         if self.arch.name == 'AMD64':
@@ -200,5 +204,5 @@ class ELFCore(ELF):
         self.registers = dict(zip(rnames, regvals))
         del self.registers['xxx']
 
-        pos = pos + nreg * arch_bytes
+        pos += nreg * arch_bytes
         self.pr_fpvalid = struct.unpack("<I", prstatus.desc[pos:pos+4])[0]

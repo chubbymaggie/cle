@@ -1,8 +1,14 @@
-import pefile
+try:
+    import pefile
+except ImportError:
+    pefile = None
+
 import archinfo
 import os
+import struct
 from ..backends import Backend, Symbol, Section
 from ..relocations import Relocation
+from ..errors import CLEError
 
 __all__ = ('PE',)
 
@@ -11,7 +17,11 @@ l = logging.getLogger('cle.pe')
 
 # Reference: https://msdn.microsoft.com/en-us/library/ms809762.aspx
 
+
 class WinSymbol(Symbol):
+    """
+    Represents a symbol for the PE format.
+    """
     def __init__(self, owner, name, addr, is_import, is_export):
         super(WinSymbol, self).__init__(owner, name, addr, owner.arch.bytes, None, None, None)
         self._is_import = is_import
@@ -28,23 +38,55 @@ class WinSymbol(Symbol):
     @property
     def is_function(self):
         """
-        All symbols in PE files point to functions
+        All symbols in PE files point to functions.
         """
         return True
 
 class WinReloc(Relocation):
-    def __init__(self, owner, symbol, addr, resolvewith):
+    """
+    Represents a relocation for the PE format.
+    """
+    def __init__(self, owner, symbol, addr, resolvewith, reloc_type=None, next_rva=None):
         super(WinReloc, self).__init__(owner, symbol, addr, None)
         self.resolvewith = resolvewith
+        self.reloc_type = reloc_type
+        self.next_rva = next_rva # only used for IMAGE_REL_BASED_HIGHADJ
 
     def resolve_symbol(self, solist):
-        return super(WinReloc, self).resolve_symbol([x for x in solist if self.resolvewith == x.provides])
+        return super(WinReloc, self).resolve_symbol([x for x in solist if self.resolvewith == x.provides or x.provides is None])
 
     @property
     def value(self):
-        return self.resolvedby.rebased_addr
+        if self.resolved:
+            return self.resolvedby.rebased_addr
+
+    def relocate(self, solist):
+        # no symbol -> this is a relocation described in the DIRECTORY_ENTRY_BASERELOC table
+        if self.symbol is None:
+            if self.reloc_type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_ABSOLUTE']:
+                # no work required
+                pass
+            elif self.reloc_type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_HIGHLOW']:
+                org_bytes = ''.join(self.owner_obj.memory.read_bytes(self.addr, 4))
+                org_value = struct.unpack('<I', org_bytes)[0]
+                rebased_value = org_value + self.owner_obj.rebase_addr - self.owner_obj.requested_base
+                rebased_bytes = struct.pack('<I', rebased_value)
+                self.owner_obj.memory.write_bytes(self.dest_addr, rebased_bytes)
+            elif self.reloc_type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_DIR64']:
+                org_bytes = ''.join(self.owner_obj.memory.read_bytes(self.addr, 8))
+                org_value = struct.unpack('<Q', org_bytes)[0]
+                rebased_value = org_value + self.owner_obj.rebase_addr - self.owner_obj.requested_base
+                rebased_bytes = struct.pack('<Q', rebased_value)
+                self.owner_obj.memory.write_bytes(self.dest_addr, rebased_bytes)
+            else:
+                l.warning('PE contains unimplemented relocation type %d', self.reloc_type)
+        else:
+            return super(WinReloc, self).relocate(solist)
 
 class PESection(Section):
+    """
+    Represents a section for the PE format.
+    """
     def __init__(self, pe_section):
         super(PESection, self).__init__(
             pe_section.Name,
@@ -61,25 +103,31 @@ class PESection(Section):
 
     @property
     def is_readable(self):
-        return self.characteristics & 0x40000000
+        return self.characteristics & 0x40000000 != 0
 
     @property
     def is_writable(self):
-        return self.characteristics & 0x20000000
+        return self.characteristics & 0x80000000 != 0
 
     @property
     def is_executable(self):
-        return self.characteristics & 0x20000000
+        return self.characteristics & 0x20000000 != 0
 
 class PE(Backend):
     """
-    Representation of a PE (i.e. Windows) binary
+    Representation of a PE (i.e. Windows) binary.
     """
 
     def __init__(self, *args, **kwargs):
+        if pefile is None:
+            raise CLEError("Install the pefile module to use the PE backend!")
+
         super(PE, self).__init__(*args, **kwargs)
 
-        self._pe = pefile.PE(self.binary)
+        if self.binary is not None:
+            self._pe = pefile.PE(data=self.binary_stream.read())
+        else:
+            self._pe = pefile.PE(self.binary)
 
         if self.arch is None:
             self.set_arch(archinfo.arch_from_id(pefile.MACHINE_TYPE[self._pe.FILE_HEADER.Machine]))
@@ -92,13 +140,15 @@ class PE(Backend):
         else:
             self.deps = []
 
-        self.provides = os.path.basename(self.binary)
-        if not self.provides.endswith('.dll'):
+        if self.binary is not None and not self.is_main_bin:
+            self.provides = os.path.basename(self.binary)
+        else:
             self.provides = None
 
         self._exports = {}
         self._handle_imports()
         self._handle_exports()
+        self._handle_relocs()
         self._register_sections()
         self.linking = 'dynamic' if len(self.deps) > 0 else 'static'
 
@@ -150,12 +200,30 @@ class PE(Backend):
                 symb = WinSymbol(self, exp.name, exp.address, False, True)
                 self._exports[exp.name] = symb
 
+    def _handle_relocs(self):
+        if hasattr(self._pe, 'DIRECTORY_ENTRY_BASERELOC'):
+            for base_reloc in self._pe.DIRECTORY_ENTRY_BASERELOC:
+                entry_idx = 0
+                while entry_idx < len(base_reloc.entries):
+                    reloc_data = base_reloc.entries[entry_idx]
+                    if reloc_data.type == pefile.RELOCATION_TYPE['IMAGE_REL_BASED_HIGHADJ']: #occupies 2 entries
+                        if entry_idx == len(base_reloc.entries):
+                            l.warning('PE contains corrupt relocation table')
+                            break
+                        next_entry = base_reloc.entries[entry_idx]
+                        entry_idx += 1
+                        reloc = WinReloc(self, None, reloc_data.rva, None, reloc_type=reloc_data.type, next_rva=next_entry.rva)
+                    else:
+                        reloc = WinReloc(self, None, reloc_data.rva, None, reloc_type=reloc_data.type)
+                    self.relocs.append(reloc)
+                    entry_idx += 1
+
     def _register_sections(self):
         """
-        Wrap self._pe.sections in PESection objects, and add them to self.sections
-        :return: None
+        Wrap self._pe.sections in PESection objects, and add them to self.sections.
         """
 
         for pe_section in self._pe.sections:
             section = PESection(pe_section)
             self.sections.append(section)
+            self.sections_map[section.name] = section
